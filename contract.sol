@@ -15,10 +15,13 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 /*
-Each deal has a fixed period (1 week here, but trivial to change) and
-two parties; both put in a stake of ETH, one (the "stable" party) exits
-with the new ETH valuation of the same underlying asset-equivalent at
-time of entry. The other (the "leveraged" party) with whatever is left.
+Each contract instance has a fixed period (1 week here, but trivial to
+change) and a fixed oracle (set on init).
+
+Each deal has two parties; both put in a stake of ETH, one (the "stable"
+party) exits with the new ETH valuation of the same underlying
+asset-equivalent at time of entry. The other (the "leveraged" party) with
+whatever is left.
 
 A deal may be finalized (and the value of either party determined and 
 transferred) only once the deal period is up or the asset value has more
@@ -80,6 +83,8 @@ contract owned {
 
 contract Oracle is owned {
     function Oracle() {}
+	
+	event Changed(uint224 current);
     
     struct Value {
         uint32 timestamp;
@@ -87,8 +92,11 @@ contract Oracle is owned {
     }
     
     function note(uint224 _value) only_owner {
-        data.value = _value;
-        data.timestamp = uint32(now);
+		if (data.value != _value) {
+			data.value = _value;
+			Changed(_value);
+		}
+		data.timestamp = uint32(now);
     }
     
     function get() constant returns (uint224) {
@@ -106,55 +114,55 @@ contract CFD {
 	struct Order {
 		address who;
 		bool is_stable;
-		uint adjustment;	// billionths by which to adjust start-price
-		uint stake;
+		uint32 adjustment;	// billionths by which to adjust start-price
+		uint128 stake;
 
-		uint prev_id;		// a linked ring
-		uint next_id;		// a linked ring
+		uint32 prev_id;		// a linked ring
+		uint32 next_id;		// a linked ring
 	}
 
 	struct Deal {
 		address stable;		// fixed to the alternative asset, and tracking the price feed of oracle
 		address leveraged;	// aka volatile (what's left from stable)
-		uint strike;
-		uint stake;
-		uint end_time;
+		uint64 strike;
+		uint128 stake;
+		uint32 end_time;
 
-		uint prev_id;		// a linked ring
-		uint next_id;		// a linked ring
+		uint32 prev_id;		// a linked ring
+		uint32 next_id;		// a linked ring
 	}
 
 	event Deposit(address indexed who, uint value);
 	event Withdraw(address indexed who, uint value);
-	event OrderPlaced(uint indexed id, address indexed who, bool indexed is_stable, uint adjustment, uint stake);
-	event OrderMatched(uint indexed id, address indexed stable, address indexed leveraged, uint deal, uint strike, uint stake);
-	event OrderCancelled(uint indexed id, address indexed who, uint stake);
-	event DealFinalized(uint indexed id, address indexed stable, address indexed leveraged, uint price);
+	event OrderPlaced(uint32 indexed id, address indexed who, bool indexed is_stable, uint32 adjustment, uint128 stake);
+	event OrderMatched(uint32 indexed id, address indexed stable, address indexed leveraged, bool is_stable, uint32 deal, uint64 strike, uint128 stake);
+	event OrderCancelled(uint32 indexed id, address indexed who, uint128 stake);
+	event DealFinalized(uint32 indexed id, address indexed stable, address indexed leveraged, uint64 price);
 
-	function CFD(address _oracle, uint _period) {
+	function CFD(address _oracle) {
 		oracle = Oracle(_oracle);
-		period = _period;
+		period = 10 minutes;
 	}
 	
-	function best_adjustment(bool _is_stable) constant returns (uint) {
+	function best_adjustment(bool _is_stable) constant returns (uint32) {
 		_is_stable = !!_is_stable;
 		var head = _is_stable ? stable : leveraged;
 		return head == 0 ? 0 : orders[head].adjustment;
 	}
 
-	function best_adjustment_for(bool _is_stable, uint _stake) constant returns (uint) {
+	function best_adjustment_for(bool _is_stable, uint128 _stake) constant returns (uint32) {
 		_is_stable = !!_is_stable;
 		var head = _is_stable ? stable : leveraged;
 		if (head == 0)
 			return 0;
 		var i = head;
-		uint accrued = 0;
+		uint128 accrued = 0;
 		for (; orders[i].next_id != head && accrued + orders[i].stake < _stake; i = orders[i].next_id)
 			accrued += orders[i].stake;
-		return orders[i].adjustment;
+		return accrued + orders[i].stake >= _stake ? orders[i].adjustment : 0;
 	}
 	
-	function deal_details(uint _id) constant returns (address stable, address leveraged, uint strike, uint stake, uint end_time) {
+	function deal_details(uint32 _id) constant returns (address stable, address leveraged, uint64 strike, uint128 stake, uint32 end_time) {
 		stable = deals[_id].stable;
 		leveraged = deals[_id].leveraged;
 		strike = deals[_id].strike;
@@ -181,13 +189,16 @@ contract CFD {
 		Withdraw(msg.sender, value);
 	}
 
-	function order(bool is_stable, uint adjustment, uint stake) {
+	function order(bool is_stable, uint32 adjustment, uint128 stake) {
 		if (msg.value == 0) {
 			if (stake > accounts[msg.sender])
 				return;
 			accounts[msg.sender] -= stake;
 		} else 
-			stake = msg.value;
+			stake = uint128(msg.value);
+		
+		if (stake < min_stake)
+			return;
 
 		// sanitize is_stable due to broken web3.js passing it as 'true'
 		is_stable = !!is_stable;
@@ -203,7 +214,7 @@ contract CFD {
 
 			// order matches; make a deal.
 			var this_stake = orders[head].stake < stake ? orders[head].stake : stake;
-			var strike = find_strike(uint(oracle.get()), is_stable ? adjustment : hadj, is_stable ? hadj : adjustment);
+			var strike = find_strike(uint64(oracle.get()), is_stable ? adjustment : hadj, is_stable ? hadj : adjustment);
 			insert_deal(is_stable ? msg.sender : orders[head].who, is_stable ? orders[head].who : msg.sender, strike, this_stake, head);
 
 			stake -= this_stake;
@@ -217,7 +228,7 @@ contract CFD {
 	}
 
 	/// withdraw an unfulfilled order, or part thereof.
-	function cancel(uint id) {
+	function cancel(uint32 id) {
 		if (orders[id].who == msg.sender) {
 			accounts[msg.sender] += orders[id].stake;
 			OrderCancelled(id, msg.sender, orders[id].stake);
@@ -226,8 +237,8 @@ contract CFD {
 	}
 
 	/// lock the current price into a now-ended or out-of-bounds deal.
-	function finalize(uint id) {
-		var price = uint(oracle.get());
+	function finalize(uint24 id) {
+		var price = uint64(oracle.get());
 		var strike = deals[id].strike;
 
 		// can't handle the price dropping by over 50%.
@@ -246,7 +257,7 @@ contract CFD {
 	}
 
 	// inserts the order into one of the two lists, ordered according to adjustment.
-	function insert_order(address who, bool is_stable, uint adjustment, uint stake) internal returns (uint id) {
+	function insert_order(address who, bool is_stable, uint32 adjustment, uint128 stake) internal returns (uint32 id) {
 		id = next_id;
 		++next_id;
 
@@ -285,7 +296,7 @@ contract CFD {
 	}
 
 	// removes an order from one of the two lists
-	function remove_order(uint id) internal {
+	function remove_order(uint32 id) internal {
 		// knit out
 		if (orders[id].prev_id != id) {
 			// if there's at least another deal in the list, reknit.
@@ -306,7 +317,7 @@ contract CFD {
 	}
 
 	// inserts the deal into deals at the end of the list.
-	function insert_deal(address stable, address leveraged, uint strike, uint stake, uint order) internal returns (uint id) {
+	function insert_deal(address stable, address leveraged, uint64 strike, uint128 stake, uint32 order) internal returns (uint32 id) {
 		// knit in at the end
 		id = next_id;
 		++next_id;
@@ -315,7 +326,7 @@ contract CFD {
 		deals[id].leveraged = leveraged;
 		deals[id].strike = strike;
 		deals[id].stake = stake;
-		deals[id].end_time = now + period;
+		deals[id].end_time = uint32(now) + period;
 
 		if (head != 0) {
 			deals[id].prev_id = deals[head].prev_id;
@@ -327,11 +338,11 @@ contract CFD {
 			deals[id].next_id = id;
 		}
 
-		OrderMatched(order, stable, leveraged, id, strike, stake);
+		OrderMatched(order, stable, leveraged, msg.sender == stable, id, strike, stake);
 	}
 
 	// removes the deal id from deals.
-	function remove_deal(uint id) internal {
+	function remove_deal(uint32 id) internal {
 		// knit out
 		if (deals[id].prev_id != id) {
 			// if there's at least another deal in the list, reknit.
@@ -347,7 +358,7 @@ contract CFD {
 	}
 
 	// return price * the stake v which is closest to 1000000000 fullfilling (v >= min(stable, leveraged), v <= max(stable, leveraged)) / 1000000000
-	function find_strike(uint price, uint stable, uint leveraged) internal returns (uint) {
+	function find_strike(uint64 price, uint32 stable, uint32 leveraged) internal returns (uint64) {
 		var stable_is_pos = stable > 1000000000;
 		var leveraged_is_pos = leveraged > 1000000000;
 		if (stable_is_pos != leveraged_is_pos)
@@ -356,17 +367,19 @@ contract CFD {
 			return price * ((stable_is_pos == (leveraged < stable)) ? leveraged : stable) / 1000000000;
 	}
 
-	Oracle oracle;
-	uint period;
+	Oracle public oracle;
+	uint32 public period;
 	
-	uint next_id = 1;
+	uint32 public next_id = 1;
 
-	mapping (uint => Order) orders;
-	uint leveraged;		// insert into linked ring, ordered ASCENDING by adjustment.
-	uint stable;		// insert into linked ring, ordered DESCENDING by adjustment.
+	mapping (uint32 => Order) public orders;
+	uint32 public leveraged;		// insert into linked ring, ordered ASCENDING by adjustment.
+	uint32 public stable;			// insert into linked ring, ordered DESCENDING by adjustment.
 
-	mapping (uint => Deal) deals;
-	uint head;			// insert into linked ring; no order.
+	mapping (uint32 => Deal) public deals;
+	uint32 public head;			// insert into linked ring; no order.
+	
+	uint128 min_stake = 100 finney;	// minimum stake to avoid dust clogging things up.
 
-	mapping (address => uint) accounts;
+	mapping (address => uint) public accounts;
 }
